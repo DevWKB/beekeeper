@@ -11,18 +11,17 @@ module BK.TUI (mainLoop) where
 -- * External Imports:
 --
 import Data.Text          (Text)
-import System.Exit        (ExitCode(..)
-                          ,exitFailure
+import System.Exit        (exitFailure
                           ,exitWith, exitSuccess)
 import Data.Time.Calendar (Day)
 import Data.Time          (getCurrentTime
                           ,UTCTime (..))
-import Data.List          (uncons)
-import System.Process     (readCreateProcessWithExitCode
-                          ,shell)
-import System.IO          (hPutStr
-                          ,stdout
-                          ,stderr)
+import System.Process     (CreateProcess (..)
+                          ,proc
+                          ,createProcess
+                          ,waitForProcess)
+import System.Environment (lookupEnv
+                          ,getEnvironment)
 
 import Options.Applicative  qualified as OptA
 import Data.Attoparsec.Text qualified as Atto
@@ -193,9 +192,9 @@ bkCmdParser :: BKMap -> OptA.Parser BKOption
 bkCmdParser bkMap = OptA.hsubparser 
     (  OptA.command "bookmark"  (OptA.info (bkAddBkParser BKBookmark) (OptA.progDesc "Add a bookmark"))
     <> OptA.command "alias"     (OptA.info (bkAddBkParser BKAlias)    (OptA.progDesc "Add an alias"))
-    <> OptA.command "run"       (OptA.info (bkRunCmdParser bkMap)           (OptA.progDesc "Runs a bookmark or alias"))
-    <> OptA.command "rename"    (OptA.info (bkRenameCmdParser bkMap)        (OptA.progDesc "Renames a bookmark or alias"))
-    <> OptA.command "remove"    (OptA.info (bkRemoveCmdParser bkMap)        (OptA.progDesc "Removes a bookmark or alias"))
+    <> OptA.command "run"       (OptA.info (bkRunCmdParser bkMap)     (OptA.progDesc "Runs a bookmark or alias"))
+    <> OptA.command "rename"    (OptA.info (bkRenameCmdParser bkMap)  (OptA.progDesc "Renames a bookmark or alias"))
+    <> OptA.command "remove"    (OptA.info (bkRemoveCmdParser bkMap)  (OptA.progDesc "Removes a bookmark or alias"))
     <> OptA.command "find"      (OptA.info (bkFindCmdParser)          (OptA.progDesc "Searches for a bookmark or alias"))
     <> OptA.command "list"      (OptA.info (bkListCmdParser)          (OptA.progDesc "Lists all bookmarks and aliases"))
     <> OptA.command "bookmarks" (OptA.info (bkListBksCmdParser)       (OptA.progDesc "Lists all bookmarks"))
@@ -308,22 +307,34 @@ handleRunbk labelbk inArgs csvContents = do
         Just b -> 
             case bkType b of
                 BKBookmark -> putStrLn . DT.unpack . bkTarget $ b
-                BKAlias -> do
-                    let cmdM = uncons $ DT.words $ bkTarget b
-                    maybe 
-                        (Lib.putStrLnStdErr $ "error: target is empty for label \"" <> (bkLabel b) <> "\"")
-                        (\(cmd',savedArgs) -> do let args = savedArgs <> inArgs
-                                                 let cmd = DT.unpack . DT.unwords $ cmd':args
-                                                 putStrLn $ "running \""<>cmd<>"\""                                                 
-                                                 (exCode,out,err) <- readCreateProcessWithExitCode (shell cmd) ""
-                                                 case exCode of
-                                                    ExitSuccess -> do putStr out                                                                       
-                                                                      exitWith ExitSuccess
-                                                    ExitFailure i -> do hPutStr stdout out
-                                                                        hPutStr stderr err
-                                                                        exitWith $ ExitFailure i)
-                        cmdM
+                BKAlias
+                    | DT.null . DT.strip $ bkTarget b ->
+                        Lib.putStrLnStdErr $ "error: target is empty for label \"" <> (bkLabel b) <> "\""
+                    | otherwise -> do
+                        sh     <- userShell
+                        curEnv <- getEnvironment
+                        -- The target is run as shell source; the extra
+                        -- arguments are passed as positional parameters
+                        -- (@$0@ is "bk") so that @"$@"@ preserves their quoting.
+                        let script = DT.unpack (bkTarget b) <> " \"$@\""
+                            -- macOS Terminal's session save/restore would print
+                            -- to stdout and share the parent tab's history file.
+                            childEnv = ("SHELL_SESSIONS_DISABLE","1")
+                                     : filter ((/= "SHELL_SESSIONS_DISABLE") . fst) curEnv
+                            cp     = (proc sh (["-i", "-c", script, "bk"] <> map DT.unpack inArgs))
+                                         { delegate_ctlc = True
+                                         , env           = Just childEnv }
+                        (_,_,_,ph) <- createProcess cp
+                        waitForProcess ph >>= exitWith
     return Nothing
+
+-- | The user's shell, taken from @$SHELL@, falling back to @/bin/sh@.
+userShell :: IO FilePath
+userShell = do
+    mShell <- lookupEnv "SHELL"
+    pure $ case mShell of
+        Just sh | not (null sh) -> sh
+        _                       -> "/bin/sh"
 
 -- | Handler for the @recents@ option.
 handleRecentsbk 
