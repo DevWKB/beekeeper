@@ -1,7 +1,7 @@
 cabal-version: 2.2
 
 name:           bk
-version:        0.1.0.0
+version:        0.1.0.1
 category:       Productivity
 synopsis:       A command-line tool for bookmarking files and managing command-line aliases
 description:    Please see the README on GitHub at <https://github.com/WorkerBee-Fitness/bk#readme>
