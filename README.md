@@ -5,9 +5,14 @@ bookmarks to locations of files + directories and aliases of commands. Then you
 can easily recall your bookmarks or run your aliases by using the label you
 create for them. The following video illustrates Beekeeper's features:
 
-![Beekeeper Demi](doc/README/assets/bk-demo.gif)
+![Beekeeper Demo](doc/README/assets/bk-demo.gif)
 
 # Installation
+
+Installing Beekeeper takes two steps: build and install the `bk` executable,
+then run `bk init` once to set it up.
+
+## Building and installing
 
 You will need [Stack](https://docs.haskellstack.org/en/stable/) a project
 management tool for the [Haskell](https://www.haskell.org/) programming
@@ -18,11 +23,48 @@ stack build
 stack install
 ```
 
-After installation there is no setup necessary. Beekeeper saves all of it's data
-to `~/.bk` by default. We strive to keep all of Beekeeper's data human readable
-and not dependent on any heavy external libraries or tools. This is the reason
-we chose [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) as
-Beekeeper's underlying data format.
+Make sure the directory `stack install` copies `bk` into (usually
+`~/.local/bin`) is on your `PATH`.
+
+## Initializing Beekeeper
+
+Before using Beekeeper for the first time run:
+
+```.bash
+bk init
+```
+
+This does the following:
+
+1. It creates `~/.bk` and an empty bookmarks file, `~/.bk/bookmarks.csv`. If the
+   bookmarks file already exists it is left untouched, so your bookmarks and
+   aliases are never lost.
+
+2. Beekeeper detects your shell from the `SHELL` environment variable and
+   installs a completion script for it. Completions cover Beekeeper's commands
+   and the labels of your bookmarks and aliases. Bash, zsh, and fish are
+   supported; any other shell are currently unsupported.
+
+   | Shell | Completion script                                   | Startup file updated                                |
+   |-------|-----------------------------------------------------|-----------------------------------------------------|
+   | bash  | `~/.bk/completions/bk.bash`                         | `~/.bash_profile` on macOS, `~/.bashrc` elsewhere  |
+   | zsh   | `~/.bk/completions/_bk`                             | `$ZDOTDIR/.zshrc` (`~/.zshrc` if `ZDOTDIR` is unset) |
+   | fish  | `$XDG_CONFIG_HOME/fish/completions/bk.fish` (`~/.config/fish/...` if unset) | none, fish loads it automatically |
+
+Restart your shell afterwards to turn on completions.
+
+It is safe to run `bk init` again, for example after upgrading Beekeeper or
+switching shells. It regenerates the completion script, never overwrites your
+bookmarks file, and only asks about the startup file if the Beekeeper block is
+not already there.
+
+## Where Beekeeper keeps its data
+
+Beekeeper saves all of its data to `~/.bk`. We strive to keep all of
+Beekeeper's data human readable and not dependent on any heavy external
+libraries or tools. This is the reason we chose
+[CSV](https://en.wikipedia.org/wiki/Comma-separated_values) as Beekeeper's
+underlying data format.
 
 # Usage
 
@@ -65,6 +107,20 @@ an alias its target is executed as a command.
 
 The above is the same as `bk run LABEL`. 
 
+Aliases run in your own shell (the one named by `SHELL`), started as an
+interactive shell with your full environment. So an alias can use anything
+you'd use at your prompt: environment variables, pipes, and the functions and
+aliases defined in your shell's startup file. `bk` exits with the same status
+as the command it ran.
+
+Any extra arguments after the label are passed on to the alias's command, with
+their quoting kept:
+
+```.bash
+bk alias greet="echo hello"
+bk greet "big world"     # runs: echo hello "big world"
+```
+
 Having the bookmark target simply output to the terminal means that we can use
 it with other commands. For example,
 
@@ -75,7 +131,7 @@ cd `bk LABEL`
 will change directory into the target of `LABEL`. This makes it easy to inject
 Beekeeper into your workflow on the command line.
 
-# Searching for a bookmark or alias
+## Searching for a bookmark or alias
 Use:
 
 ```.bash
@@ -85,14 +141,14 @@ bk find LABEL
 to search for the target whose label is `LABEL`. A more sophisticated search is
 underdevelopment.
 
-# Renaming a bookmark or alias
+## Renaming a bookmark or alias
 Use:
 
 ```.bash
 bk rename OLD_LABEL NEW_LABEL
 ```
 
-# Removing a bookmark or alias
+## Removing a bookmark or alias
 Use:
 
 ```.bash
@@ -101,7 +157,7 @@ bk remove LABEL
 
 to remove a bookmark or alias.
 
-# Listing bookmarks
+## Listing bookmarks
 If you run Beekeeper with no arguments at all:
 
 ```.bash
@@ -131,18 +187,36 @@ bk list
 
 to see a list of all bookmarks and aliases.
 
-
-# Help and version
+## Help and version
 Use:
 
 ```.bash
-bk help
+bk --help
 ```
 
 for the help menu and use:
 
 ```.bash
-bk version
+bk --version
 ```
 
 to show the currently installed version.
+
+# Contributing
+## Testing
+
+Shell integration tests live in `test/shell`. They run `bk init`, bookmarks, and
+aliases against real bash, zsh, and fish shells, each starting from a fresh,
+empty `HOME`. The easiest way to run them is in Docker, which builds `bk` and
+installs all three shells for you:
+
+```.bash
+cd test
+docker compose run --rm bk            # all shells
+docker compose run --rm bk fish       # just fish
+docker compose run --rm bk zsh bash   # a subset, in that order
+```
+
+To run them without Docker, put `bk` on your `PATH` and run
+`test/shell/run.sh [SHELL...]`. Set `KEEP_HOMES=1` to keep each shell's
+temporary `HOME` afterwards for inspection.
