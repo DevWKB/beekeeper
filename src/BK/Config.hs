@@ -18,7 +18,7 @@ progName :: String
 progName = "bk"
 
 progVersion :: String
-progVersion = "v0.2"
+progVersion = "v0.3"
 
 -- | The location we store all of BK's configuration files.
 bkHomeDir :: IO FilePath
