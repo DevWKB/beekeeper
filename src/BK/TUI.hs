@@ -5,7 +5,8 @@
 {-# LANGUAGE DataKinds              #-}
 {-# OPTIONS_GHC -Wno-partial-fields #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
-module BK.TUI (mainLoop) where
+{-# LANGUAGE LambdaCase #-}
+module BK.TUI (mainLoop, handleMapOpt) where
 
 --
 -- * External Imports:
@@ -22,6 +23,7 @@ import System.Process     (CreateProcess (..)
                           ,waitForProcess)
 import System.Environment (lookupEnv
                           ,getEnvironment)
+import Control.Monad      (when)
 
 import Options.Applicative  qualified as OptA
 import Data.Attoparsec.Text qualified as Atto
@@ -44,27 +46,20 @@ import BK.BKMap  (BKType (..)
                  ,filterBKMap
                  ,isAlias
                  ,isBookmark
-                 ,readCSVFile
-                 ,writeCSVFile
-                 ,initializeWorkDir
                  ,filterLabels
                  ,renameBookmark)
 
 import BK.Lib    qualified as Lib
-import Data.Char qualified as DT
-
-_progName :: String
-_progName = "bk"
-
-_progVersion :: String
-_progVersion = "v0.2"
+import Data.Char qualified as DC
+import BK.CSV (readBookmarksCSVFile, bookmarkCSVFilePath, readCSVFile, writeCSVFile)
+import BK.Config (progVersion, progName)
+import BK.Setup (initBK)
 
 --
 -- * Option parsing
 -- 
 
--- | All available command-line options.
-data BKOption
+data MapOption 
     = OptAddBK BKType Text Text -- ^ Option "add" handles both bookmarks and aliases.
     | OptRenameBK Text Text     -- ^ Option "rename" handles renaming a bookmark/alias.
     | OptRunBK Text [Text]      -- ^ Option "run" handles running a bookmark with arguments.
@@ -74,7 +69,13 @@ data BKOption
     | OptBookmarks              -- ^ Option "bookmarks" outputs all bookmarks to the terminal.    
     | OptAliases                -- ^ Option "aliases" outputs all aliases to the terminal.    
     | OptRecentsBK              -- ^ Option "recents" outputs the recently added bookmarks and aliases to the terminal.
-    deriving (Show)
+    deriving Show
+
+-- | All available command-line options.
+data BKOption
+    = MapOpt MapOption          -- ^ Options for manipulating the map.
+    | OptInit                   -- ^ Option "init"  initializes bk.
+    deriving Show
 
 --
 -- ** Attoparsec Parsers
@@ -96,9 +97,9 @@ assignParser = do
 labelParser :: Atto.Parser Text
 labelParser = do
     startChar <- Atto.take 1      
-    if DT.all DT.isAlpha startChar
+    if DT.all DC.isAlpha startChar
     then do
-        rest <- Atto.takeWhile1 $ DT.isAlphaNum `Lib.orF` (`elem` ['-','_'])             
+        rest <- Atto.takeWhile1 $ DC.isAlphaNum `Lib.orF` (`elem` ['-','_'])             
         return $ DT.append startChar rest
     else fail $ "parse error: bookmark labels must start with a letter."
 
@@ -120,7 +121,7 @@ optAddBKParser
     -> Atto.Parser BKOption
 optAddBKParser bkType = do 
     (label,target) <- assignParser
-    return $ OptAddBK bkType label target
+    return $ MapOpt $ OptAddBK bkType label target
 
 --
 -- ** Optparse-Applicative Parsers
@@ -134,102 +135,130 @@ bkAddBkParser
 bkAddBkParser bkType = OptA.argument (parser bkType) (OptA.metavar "LABEL=TARGET")
     where
         parser :: BKType -> OptA.ReadM BKOption
-        parser bkType = OptA.eitherReader $ Atto.parseOnly (optAddBKParser bkType) . DT.pack
+        parser bkType = OptA.eitherReader 
+                      $ Atto.parseOnly (optAddBKParser bkType) . DT.pack
 
-completeLabel :: BKMap -> String -> IO [String]
-completeLabel bkMap partial = do
-    putStrLn "Completer called"
-    return . map DT.unpack $ filterLabels (\l -> (DT.pack partial) `DT.isPrefixOf` l) bkMap
+completeLabel :: String -> IO [String]
+completeLabel partial = do
+    bkMap <- readBookmarksCSVFile
+    return . map DT.unpack $ filterLabels labelMatch bkMap
+  where
+    labelMatch l = DT.isPrefixOf (DT.toLower . DT.pack $ partial) $ DT.toLower l
 
 -- | Parses the arguments to the run option.
-bkRunCmdParser 
-    :: BKMap
-    -> OptA.Parser BKOption
-bkRunCmdParser bkMap = OptRunBK
-                    <$> OptA.argument labelArg (OptA.metavar "LABEL" <> OptA.completer (OptA.mkCompleter (completeLabel bkMap)))  
-                    <*> (OptA.many $ OptA.argument OptA.str (OptA.metavar "ARGS"))    
+bkRunCmdParser :: OptA.Parser BKOption
+bkRunCmdParser  = MapOpt 
+               <$> (OptRunBK
+                 <$> (OptA.argument labelArg 
+                         (OptA.metavar "LABEL" 
+                       <> OptA.completer (OptA.mkCompleter completeLabel)))
+                 <*> (OptA.many $ OptA.argument OptA.str (OptA.metavar "ARGS")))
 
 -- | Parses the arguments to the @remove@ command.
-bkRemoveCmdParser 
-    :: BKMap
-    -> OptA.Parser BKOption    
-bkRemoveCmdParser bkMap 
-    = OptRemoveBK
-   <$> OptA.argument labelArg (OptA.metavar "LABEL" <> OptA.completer (OptA.mkCompleter (completeLabel bkMap)))      
+bkRemoveCmdParser :: OptA.Parser BKOption    
+bkRemoveCmdParser  
+    = MapOpt 
+    <$> OptRemoveBK
+    <$> OptA.argument labelArg (OptA.metavar "LABEL" <> OptA.completer (OptA.mkCompleter completeLabel))      
 
 -- | Parses the arguments to the @rename@ command.
-bkRenameCmdParser 
-    :: BKMap
-    -> OptA.Parser BKOption    
-bkRenameCmdParser bkMap 
-    = OptRenameBK
-   <$> OptA.argument labelArg (OptA.metavar "LABEL1" <> OptA.completer (OptA.mkCompleter (completeLabel bkMap)))      
-   <*> OptA.argument labelArg (OptA.metavar "LABEL2")      
+bkRenameCmdParser :: OptA.Parser BKOption    
+bkRenameCmdParser
+    = MapOpt 
+   <$> (OptRenameBK
+     <$> OptA.argument labelArg 
+           (OptA.metavar "LABEL1" 
+         <> OptA.completer (OptA.mkCompleter completeLabel))      
+     <*> OptA.argument labelArg (OptA.metavar "LABEL2"))
 
 -- | Parses the argument to @find@ command.
 bkFindCmdParser :: OptA.Parser BKOption
-bkFindCmdParser = OptFindBK
-               <$> OptA.argument labelArg (OptA.metavar "LABEL")      
+bkFindCmdParser 
+    = MapOpt 
+   <$> OptFindBK
+   <$> OptA.argument labelArg (OptA.metavar "LABEL")      
 
 -- | Parses the @list@ command.
 bkListCmdParser :: OptA.Parser BKOption
-bkListCmdParser = pure OptList
+bkListCmdParser = pure $ MapOpt OptList
 
 -- | Parses the @bookmarks@ command.
 bkListBksCmdParser :: OptA.Parser BKOption
-bkListBksCmdParser = pure OptBookmarks
+bkListBksCmdParser = pure $ MapOpt OptBookmarks
 
 -- | Parses the @aliases@ command.
 bkListAliasesCmdParser :: OptA.Parser BKOption
-bkListAliasesCmdParser = pure OptAliases
+bkListAliasesCmdParser = pure $ MapOpt OptAliases
 
 -- | Parses the @aliases@ command.
 bkRecentsParser :: OptA.Parser BKOption
-bkRecentsParser = pure OptRecentsBK
+bkRecentsParser = pure $ MapOpt OptRecentsBK
+
+-- | Parses the @init@ command.
+bkInitBkParser :: OptA.Parser BKOption
+bkInitBkParser = pure OptInit
 
 -- | Parses the various command-line options.
-bkCmdParser :: BKMap -> OptA.Parser BKOption
-bkCmdParser bkMap = OptA.hsubparser 
-    (  OptA.command "bookmark"  (OptA.info (bkAddBkParser BKBookmark) (OptA.progDesc "Add a bookmark"))
-    <> OptA.command "alias"     (OptA.info (bkAddBkParser BKAlias)    (OptA.progDesc "Add an alias"))
-    <> OptA.command "run"       (OptA.info (bkRunCmdParser bkMap)     (OptA.progDesc "Runs a bookmark or alias"))
-    <> OptA.command "rename"    (OptA.info (bkRenameCmdParser bkMap)  (OptA.progDesc "Renames a bookmark or alias"))
-    <> OptA.command "remove"    (OptA.info (bkRemoveCmdParser bkMap)  (OptA.progDesc "Removes a bookmark or alias"))
-    <> OptA.command "find"      (OptA.info (bkFindCmdParser)          (OptA.progDesc "Searches for a bookmark or alias"))
-    <> OptA.command "list"      (OptA.info (bkListCmdParser)          (OptA.progDesc "Lists all bookmarks and aliases"))
-    <> OptA.command "bookmarks" (OptA.info (bkListBksCmdParser)       (OptA.progDesc "Lists all bookmarks"))
-    <> OptA.command "aliases"   (OptA.info (bkListAliasesCmdParser)   (OptA.progDesc "Lists all aliases"))
-    )
-    OptA.<|> (bkRunCmdParser bkMap)  -- run is the default when no commands are given.
-    OptA.<|> bkRecentsParser         -- No options or arguments, then show recents.
+bkCmdParser :: OptA.Parser BKOption
+bkCmdParser = OptA.hsubparser 
+ (  OptA.command "init"      (OptA.info bkInitBkParser   
+                             (OptA.progDesc "Initialize bk's configuration"))
+ <> OptA.command "bookmark"  (OptA.info (bkAddBkParser BKBookmark) 
+                             (OptA.progDesc "Add a bookmark"))
+ <> OptA.command "alias"     (OptA.info (bkAddBkParser BKAlias)    
+                             (OptA.progDesc "Add an alias"))
+ <> OptA.command "run"       (OptA.info bkRunCmdParser             
+                             (OptA.progDesc "Runs a bookmark or alias"))
+ <> OptA.command "rename"    (OptA.info bkRenameCmdParser          
+                             (OptA.progDesc "Renames a bookmark or alias"))
+ <> OptA.command "remove"    (OptA.info bkRemoveCmdParser          
+                             (OptA.progDesc "Removes a bookmark or alias"))
+ <> OptA.command "find"      (OptA.info (bkFindCmdParser)          
+                             (OptA.progDesc "Searches for a bookmark or alias"))
+ <> OptA.command "list"      (OptA.info (bkListCmdParser)          
+                             (OptA.progDesc "Lists all bookmarks and aliases"))
+ <> OptA.command "bookmarks" (OptA.info (bkListBksCmdParser)       
+                             (OptA.progDesc "Lists all bookmarks"))
+ <> OptA.command "aliases"   (OptA.info (bkListAliasesCmdParser)   
+                             (OptA.progDesc "Lists all aliases"))
+ )
+ OptA.<|> bkRunCmdParser       -- run is the default when no commands are given.
+ OptA.<|> bkRecentsParser      -- No options or arguments, then show recents.
 
 -- | Generates the various additional options and messages using the command
 -- parser. This adds the @--help@ and @--version@ options as well as the program
 -- description and header for the help message.
+bkOpts :: OptA.ParserInfo BKOption
 bkOpts 
-    :: BKMap                     -- Contents of CSV file
-    -> OptA.ParserInfo BKOption
-bkOpts bkMap = OptA.info ((bkCmdParser bkMap) OptA.<**> OptA.helper OptA.<**> OptA.simpleVersioner _progVersion)
-    (OptA.fullDesc <> OptA.progDesc _progName <> OptA.header "BeeKeeper remembers so you don't have to!")
+  = OptA.info 
+      (bkCmdParser OptA.<**> OptA.helper 
+                   OptA.<**> OptA.simpleVersioner progVersion)
+      (OptA.fullDesc 
+             <> OptA.progDesc progName 
+             <> OptA.header "BeeKeeper remembers so you don't have to!")
 
 --
 -- * Option Handlers
 -- 
 
--- | Runs an options handler.
-handleOpt 
-    :: BKOption -- ^ Option to handle
-    -> BKMap
+-- | Handles initialization.
+handleOptInit :: IO ()
+handleOptInit = initBK
+
+-- | Handles any command that manipulates the map.
+handleMapOpt 
+    :: MapOption -- ^ Option to handle
+    -> BKMap     
     -> IO (Maybe BKMap)
-handleOpt OptRecentsBK        bkMap = handleRecentsbk bkMap
-handleOpt OptList             bkMap = handleListBookmarks Nothing bkMap
-handleOpt OptBookmarks        bkMap = handleListBookmarks (Just BKBookmark) bkMap
-handleOpt OptAliases          bkMap = handleListBookmarks (Just BKAlias) bkMap
-handleOpt (OptAddBK ty l t)   bkMap = handleAddbk ty l t bkMap
-handleOpt (OptFindBK l)       bkMap = handleFindbk l bkMap
-handleOpt (OptRunBK l args)   bkMap = handleRunbk l args bkMap
-handleOpt (OptRemoveBK l)     bkMap = handleRemovebk l bkMap
-handleOpt (OptRenameBK l1 l2) bkMap = handleRenamebk l1 l2 bkMap
+handleMapOpt OptRecentsBK        bkMap = handleRecentsbk bkMap
+handleMapOpt OptList             bkMap = handleListBookmarks Nothing bkMap
+handleMapOpt OptBookmarks        bkMap = handleListBookmarks (Just BKBookmark) bkMap
+handleMapOpt OptAliases          bkMap = handleListBookmarks (Just BKAlias) bkMap
+handleMapOpt (OptAddBK ty l t)   bkMap = handleAddbk ty l t bkMap
+handleMapOpt (OptFindBK l)       bkMap = handleFindbk l bkMap
+handleMapOpt (OptRunBK l args)   bkMap = handleRunbk l args bkMap
+handleMapOpt (OptRemoveBK l)     bkMap = handleRemovebk l bkMap
+handleMapOpt (OptRenameBK l1 l2) bkMap = handleRenamebk l1 l2 bkMap
 
 -- | Handler for the @add@ option.
 handleAddbk 
@@ -367,17 +396,36 @@ handleListBookmarks mbkType csvContents =
         pred (Just BKAlias) bk    = isAlias bk
         pred (Just BKBookmark) bk = isBookmark bk
 
+_handler :: Bool -> (BKMap  -> IO BKMap) -> IO ()
+_handler writeMode action = 
+    do bookmarkCSVFile <- bookmarkCSVFilePath
+       (errs,csvContents) <- readCSVFile bookmarkCSVFile       
+       if null errs
+       then do csvContents' <- action csvContents                                       
+               when writeMode $ 
+                 writeCSVFile bookmarkCSVFile csvContents'
+               exitSuccess
+       else print errs >> exitFailure
+
+mainHandler :: MapOption -> IO ()
+mainHandler opt
+    = do bookmarkCSVFile <- bookmarkCSVFilePath
+         bookmarkCSVFileExists <- Lib.doesFileExist bookmarkCSVFile
+         when bookmarkCSVFileExists $ do 
+           (errs,csvContents) <- readCSVFile bookmarkCSVFile       
+           if null errs
+           then do
+             updatedMapM <- handleMapOpt opt csvContents
+             maybe (return ())
+                   (writeCSVFile bookmarkCSVFile)
+                   updatedMapM
+             exitSuccess
+            else print errs >> exitFailure
+         Lib.exitFailureWithMsg $ "bk uninitialized, run `bk init`."
+
 -- | The main loop. 
 -- This is called by the `Main` module.
 mainLoop ::  IO ()
-mainLoop = do
-    bookmarkCSVFile <- initializeWorkDir     
-    (errs,csvContents) <- readCSVFile bookmarkCSVFile       
-    if null errs
-    then OptA.execParser (bkOpts csvContents) >>= \opt ->
-            do updatedMapM <- handleOpt opt csvContents
-               maybe (return ())
-                     (writeCSVFile bookmarkCSVFile)
-                     updatedMapM
-               exitSuccess
-    else print errs >> exitFailure
+mainLoop = OptA.execParser bkOpts >>= \case
+    OptInit    -> handleOptInit
+    MapOpt opt -> mainHandler opt    

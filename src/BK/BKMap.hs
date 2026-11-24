@@ -1,25 +1,19 @@
 {-# LANGUAGE    LambdaCase        #-}
 {-# LANGUAGE    BangPatterns      #-}
-{-# LANGUAGE    LinearTypes       #-}
-{-# LANGUAGE    NoImplicitPrelude #-}
 {-# LANGUAGE    QualifiedDo       #-}
 {-# LANGUAGE    OverloadedStrings #-}
 {-# LANGUAGE    ViewPatterns      #-}
 {-# OPTIONS_GHC -Wno-orphans      #-}
 module BK.BKMap
     (BKMap,
-     Bookmark(bkType,bkLabel, bkTarget, bkCreated, bkLastUsed),    
+     Bookmark(..),    
      BKType(..),  
      bookmark,
-     parseBKType,   
-     readCSVFile,
-     writeCSVFile,
+     parseBKType,
      addBookmark,
      removeBookmark,
      renameBookmark,
      findBookmark,
-     handler,
-     handler_,
      recentBookmarks,
      isAlias,
      isBookmark,
@@ -28,41 +22,13 @@ module BK.BKMap
      showBKType,
      filterBKMap,
      filterLabels,
-     initializeWorkDir,
-     emptyBKMap) where
+     emptyBKMap,
+     bookmarks,
+     insertBK) where
 
 -- External Imports:
-import Prelude.Linear           (Show(..),
-                                 Bool(..),
-                                 String,
-                                 IO,
-                                 Either,
-                                 FilePath,
-                                 putStrLn,
-                                 otherwise, IsString (..))
-import Prelude                  (Either (..),
-                                 Foldable (..),
-                                 Eq (..),
-                                 Maybe (..),
-                                 Int,
-                                 Ord (..),
-                                 Num (..),
-                                 MonadFail (fail),
-                                 ($),
-                                 (.),
-                                 id,
-                                 error,
-                                 not,
-                                 (<=),
-                                 (&&),
-                                 map,
-                                 (<>),
-                                 print,
-                                 flip, Applicative (..))
 import GHC.Generics             (Generic)
-import Data.Text                (Text, 
-                                 concat, 
-                                 pack)
+import Data.Text                (Text)
 import Data.Csv                 (FromRecord(..), 
                                  ToRecord(..), 
                                  FromField (..), 
@@ -70,21 +36,13 @@ import Data.Csv                 (FromRecord(..),
                                  ToField (..),                              
                                  ToNamedRecord (..),                              
                                  NamedRecord, 
-                                 Name, 
                                  Parser,
                                  namedRecord, 
-                                 (.=),
-                                 encodeByName)
-import System.Exit              (exitFailure, 
-                                 exitSuccess)
+                                 (.=))
 import System.FilePath          (isValid,
                                  isAbsolute,
                                  normalise,
                                  dropTrailingPathSeparator)
-import Control.Monad            (Monad(..), 
-                                 return, 
-                                 when)
-import GHC.IO.IOMode            (IOMode(..))
 import Data.Bifunctor           (Bifunctor(bimap))
 import Data.Time.Calendar       (Day, 
                                  addDays)
@@ -92,22 +50,15 @@ import Data.Time.Format.ISO8601 (ISO8601 (iso8601Format),
                                  Format (formatShowM),
                                  formatParseM)
 
-import  Prelude                   qualified as Prelude
-import  Control.Functor.Linear    qualified as Linear
-import  System.IO.Resource.Linear qualified as Linear
-import  Data.Unrestricted.Linear  qualified as Linear
 import  Data.Text                 qualified as DT 
 import  Data.Char                 qualified as DT
-import  Data.ByteString           qualified as BS
-import  Data.Csv.Incremental      qualified as CsvInc
-import  Data.Vector               qualified as Vec
 import  Data.Map                  qualified as Map
 
 --
 -- * Internal Imports
 
 import BK.Lib qualified as Lib
-
+import Data.String (fromString)
 
 _undefined :: a
 _undefined = Prelude.undefined
@@ -222,14 +173,6 @@ updateBookmarkTarget (Bookmark bktype bklabel _ bkcreated bklastused) bktarget
         bkLastUsed = bklastused 
     }
 
-header :: Vec.Vector Name
-header = Vec.fromList 
-    ["type",
-     "label",
-     "target",
-     "created-data",
-     "last-used"]
-
 instance ToNamedRecord Bookmark where
     toNamedRecord :: Bookmark -> NamedRecord
     toNamedRecord b = namedRecord [
@@ -285,21 +228,21 @@ foldlBKMap f s = Map.foldl f s . getBKMap
 filterBKMap :: (Bookmark -> Bool)
             -> BKMap
             -> BKMap
-filterBKMap pred bkMap = BKMap {
+filterBKMap _pred bkMap = BKMap {
         getBKMap = newMap,
         getBKMapMaxLabelLength = newMax
     }
     where
         _map = getBKMap bkMap
-        newMap = Map.filter pred _map
+        newMap = Map.filter _pred _map
         newMax = maxLabels newMap
 
 filterLabels 
     :: (Text -> Bool)
     -> BKMap
     -> [Text]
-filterLabels filter (getBKMap->bkMap) = 
-    Map.keys $ Map.filter (filter . bkLabel) bkMap
+filterLabels _filter (getBKMap->bkMap) = 
+    Map.keys $ Map.filter (_filter . bkLabel) bkMap
 
 toAssocList :: BKMap -> [(Text,Bookmark)]
 toAssocList (BKMap _map _) = Map.assocs _map
@@ -325,84 +268,6 @@ showBKMap maxOffset bkMap = _showBKMap $ toAssocList bkMap
         _showBKMap ((label,bk):bks) 
              = toBKAssignment maxOffset (bkType bk) label (bkTarget bk) <> "\n"
             <> _showBKMap bks
-
-_logDebug 
-    :: String 
-    -> Linear.RIO ()
-_logDebug !s = Linear.do
-    h <- Linear.unsafeAcquire (Linear.return (Linear.Ur ())) (\_ -> Linear.return ())
-    r <- Linear.unsafeFromSystemIOResource_ (\_ -> putStrLn s) h
-    Linear.release r
-
-feedCSVFile 
-    :: (BS.ByteString -> CsvInc.Parser Bookmark)
-    -> Linear.Handle %1
-    -> Linear.RIO (Linear.Ur (CsvInc.Parser Bookmark), Linear.Handle)
-feedCSVFile parserFam csvFile = Linear.do
-    (Linear.Ur isEOF, csvFile') <- Linear.hIsEOF csvFile
-    if isEOF
-    then Linear.return (Linear.Ur (parserFam BS.empty),csvFile')
-    else Linear.do
-        (Linear.Ur line,csvFile'') <- Linear.hGetLine csvFile'
-        let line' = Lib.textUTF8ToByteString (Data.Text.concat [line,(Data.Text.pack "\n")])
-        let parser = parserFam line'
-        Linear.return (Linear.Ur parser,csvFile'')
-
-updateAcc :: ([Text], BKMap)
-          -> [Either String Bookmark]
-          -> ([Text], BKMap)
-updateAcc acc = Prelude.foldl upAcc acc
-    where
-        upAcc (errs,bkMap) (Left errMsg) = (errs <> [DT.pack errMsg],bkMap)
-        upAcc (errs,bkMap) (Right b)     = (errs,insertBK b bkMap)
-
-loop :: ([Text], BKMap)
-     -> Linear.Handle %1
-     -> CsvInc.Parser Bookmark 
-     -> Linear.RIO (Linear.Ur ([Text], BKMap))
-loop acc csvFile (CsvInc.Fail _ errMsg)   
-    = Linear.do 
-        Linear.release csvFile 
-        Linear.return (Linear.Ur (updateAcc acc [Left errMsg]))
-
-loop acc csvFile (CsvInc.Many rs parserFam) 
-    = Linear.do         
-        (Linear.Ur parser,csvFile'') <- feedCSVFile parserFam csvFile
-        loop (updateAcc acc rs) csvFile'' parser                                       
-
-loop acc csvFile (CsvInc.Done rs) 
-    = Linear.do     
-        Linear.release csvFile 
-        Linear.return (Linear.Ur (updateAcc acc rs))
-
-readCSVFile 
-    :: FilePath 
-    -> IO ([Text], BKMap)
-readCSVFile csvFilePath = Linear.run $ readCSVFile' 
-    where
-        readCSVFile' 
-            :: Linear.RIO (Linear.Ur ([Text], BKMap))
-        readCSVFile' = Linear.do            
-            csvFile <- Linear.openFile csvFilePath ReadMode
-            (Linear.Ur contents) <- loop ([],emptyBKMap) csvFile (CsvInc.decode CsvInc.HasHeader) 
-            Linear.return (Linear.Ur contents)
-
-writeCSVFile
-    :: FilePath
-    -> BKMap
-    -> IO ()
-writeCSVFile csvFilePath bkMap = Linear.run writeCSVFile' 
-    where        
-        bks = Lib.byteStringToTextUTF8 . 
-                Lib.lazyByteStringToByteString $ 
-                    encodeByName header $ bookmarks bkMap
-
-        writeCSVFile' :: Linear.RIO (Linear.Ur ())
-        writeCSVFile' = Linear.do
-            csvFile <- Linear.openFile csvFilePath WriteMode
-            csvFile' <- Linear.hPutStr csvFile bks
-            Linear.release csvFile'
-            Linear.return (Linear.Ur ())
 
 bookmarkAsAssignment :: Bookmark -> Text
 bookmarkAsAssignment b = toBKAssignment 0 (bkType b) (bkLabel b) (bkTarget b)
@@ -470,30 +335,3 @@ recentBookmarks today bkMap = partitionBKMap isAlias $ filterBKMap recentBookmar
         recentBookmark :: Bookmark -> Bool
         recentBookmark (Bookmark _ _ _ _ lastUsedDay) = 
             addDays (-10) today <= lastUsedDay && lastUsedDay <= today
-
-handler_ :: (BKMap  -> IO ()) -> IO ()
-handler_ handle = _handler False (\m -> handle m >> return m)
-
-handler :: (BKMap  -> IO BKMap) -> IO ()
-handler = _handler True
-
-initializeWorkDir :: IO FilePath
-initializeWorkDir = do 
-    homeDir <- Lib.getHomeDirectory
-    let wdir = homeDir <> "/.bk"
-    let bookmarkCSVFile = wdir <> "/bookmarks.csv"
-    Lib.createDirectoryIfMissing False wdir
-    bookmarkCSVFileExists <- Lib.doesFileExist bookmarkCSVFile
-    when (not bookmarkCSVFileExists) $ 
-        writeCSVFile bookmarkCSVFile emptyBKMap
-    return bookmarkCSVFile
-
-_handler :: Bool -> (BKMap  -> IO BKMap) -> IO ()
-_handler writeMode action = 
-    do bookmarkCSVFile <- initializeWorkDir     
-       (errs,csvContents) <- readCSVFile bookmarkCSVFile       
-       if null errs
-       then do csvContents' <- action csvContents                                       
-               when writeMode $ writeCSVFile bookmarkCSVFile csvContents'
-               exitSuccess
-       else print errs >> exitFailure

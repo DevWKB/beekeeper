@@ -99,6 +99,8 @@ library
     ,prod-ghc-flags
   exposed-modules:
       BK.Setup
+      BK.CSV
+      BK.Config
       BK.TUI
       BK.BKMap
       BK.Lib      
