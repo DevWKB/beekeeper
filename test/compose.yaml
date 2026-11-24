@@ -1,0 +1,20 @@
+name: bk
+
+services:
+  base:
+    image: bk-base:latest
+    build:
+      context: .
+      dockerfile: Docker.base
+
+  bk:
+    build:
+      # The repository root, so the Dockerfile can copy bk's sources.
+      context: ..
+      dockerfile: test/Dockerfile
+      network: host
+      # Satisfies `FROM bk-base` with the `base` service's image, which also
+      # makes compose build `base` before `bk`.
+      additional_contexts:
+        bk-base: service:base
+    container_name: bk

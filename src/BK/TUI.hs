@@ -24,6 +24,7 @@ import System.Process     (CreateProcess (..)
 import System.Environment (lookupEnv
                           ,getEnvironment)
 import Control.Monad      (when)
+import System.FilePath    (takeFileName)
 
 import Options.Applicative  qualified as OptA
 import Data.Attoparsec.Text qualified as Atto
@@ -343,14 +344,24 @@ handleRunbk labelbk inArgs csvContents = do
                         sh     <- userShell
                         curEnv <- getEnvironment
                         -- The target is run as shell source; the extra
-                        -- arguments are passed as positional parameters
-                        -- (@$0@ is "bk") so that @"$@"@ preserves their quoting.
-                        let script = DT.unpack (bkTarget b) <> " \"$@\""
+                        -- arguments are passed as positional parameters so
+                        -- that their quoting is preserved.
+                        --
+                        -- POSIX-style shells: @"$@"@, with @$0@ set to "bk".
+                        -- fish: @$argv@, which holds every argument after the
+                        -- script (there is no @$0@ slot, and fish rejects
+                        -- @$@@). Fish doesn't word-split or glob variable
+                        -- values, so @$argv@ needs no quoting.
+                        let isFish = takeFileName sh == "fish"
+                            (argRef, zeroArg)
+                              | isFish    = (" $argv",  [])
+                              | otherwise = (" \"$@\"", ["bk"])
+                            script = DT.unpack (bkTarget b) <> argRef
                             -- macOS Terminal's session save/restore would print
                             -- to stdout and share the parent tab's history file.
                             childEnv = ("SHELL_SESSIONS_DISABLE","1")
                                      : filter ((/= "SHELL_SESSIONS_DISABLE") . fst) curEnv
-                            cp     = (proc sh (["-i", "-c", script, "bk"] <> map DT.unpack inArgs))
+                            cp     = (proc sh (["-i", "-c", script] <> zeroArg <> map DT.unpack inArgs))
                                          { delegate_ctlc = True
                                          , env           = Just childEnv }
                         (_,_,_,ph) <- createProcess cp
