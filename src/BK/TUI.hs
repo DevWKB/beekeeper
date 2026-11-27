@@ -13,7 +13,7 @@ module BK.TUI (mainLoop, handleMapOpt) where
 --
 import Data.Text          (Text)
 import System.Exit        (exitFailure
-                          ,exitWith, exitSuccess)
+                          ,exitWith, exitSuccess, ExitCode)
 import Data.Time.Calendar (Day)
 import Data.Time          (getCurrentTime
                           ,UTCTime (..))
@@ -23,7 +23,7 @@ import System.Process     (CreateProcess (..)
                           ,waitForProcess)
 import System.Environment (lookupEnv
                           ,getEnvironment)
-import Control.Monad      (when)
+import Control.Monad      (void, when)
 import System.FilePath    (takeFileName)
 
 import Options.Applicative  qualified as OptA
@@ -55,6 +55,7 @@ import Data.Char qualified as DC
 import BK.CSV (readBookmarksCSVFile, bookmarkCSVFilePath, readCSVFile, writeCSVFile)
 import BK.Config (progVersion, progName)
 import BK.Setup (initBK)
+import BK.Shell (runCmdInShell)
 
 --
 -- * Option parsing
@@ -244,7 +245,7 @@ bkOpts
 
 -- | Handles initialization.
 handleOptInit :: IO ()
-handleOptInit = initBK
+handleOptInit = void initBK
 
 -- | Handles any command that manipulates the map.
 handleMapOpt 
@@ -257,7 +258,8 @@ handleMapOpt OptBookmarks        bkMap = handleListBookmarks (Just BKBookmark) b
 handleMapOpt OptAliases          bkMap = handleListBookmarks (Just BKAlias) bkMap
 handleMapOpt (OptAddBK ty l t)   bkMap = handleAddbk ty l t bkMap
 handleMapOpt (OptFindBK l)       bkMap = handleFindbk l bkMap
-handleMapOpt (OptRunBK l args)   bkMap = handleRunbk l args bkMap
+handleMapOpt (OptRunBK l args)   bkMap = handleRunbk l args bkMap 
+                                      >> pure Nothing
 handleMapOpt (OptRemoveBK l)     bkMap = handleRemovebk l bkMap
 handleMapOpt (OptRenameBK l1 l2) bkMap = handleRenamebk l1 l2 bkMap
 
@@ -330,7 +332,7 @@ handleRunbk
     :: Text   -- ^ Label of the bookmark to run
     -> [Text] -- ^ List of arguments to pass to the target
     -> BKMap  -- ^ Contents of the CSV file
-    -> IO (Maybe BKMap)
+    -> IO ()
 handleRunbk labelbk inArgs csvContents = do
     case findBookmark labelbk csvContents of
         Nothing -> Lib.putStrLnStdErr $ "bookmark not found " <> DT.show labelbk
@@ -339,42 +341,12 @@ handleRunbk labelbk inArgs csvContents = do
                 BKBookmark -> putStrLn . DT.unpack . bkTarget $ b
                 BKAlias
                     | DT.null . DT.strip $ bkTarget b ->
-                        Lib.putStrLnStdErr $ "error: target is empty for label \"" <> (bkLabel b) <> "\""
-                    | otherwise -> do
-                        sh     <- userShell
-                        curEnv <- getEnvironment
-                        -- The target is run as shell source; the extra
-                        -- arguments are passed as positional parameters so
-                        -- that their quoting is preserved.
-                        --
-                        -- POSIX-style shells: @"$@"@, with @$0@ set to "bk".
-                        -- fish: @$argv@, which holds every argument after the
-                        -- script (there is no @$0@ slot, and fish rejects
-                        -- @$@@). Fish doesn't word-split or glob variable
-                        -- values, so @$argv@ needs no quoting.
-                        let isFish = takeFileName sh == "fish"
-                            (argRef, zeroArg)
-                              | isFish    = (" $argv",  [])
-                              | otherwise = (" \"$@\"", ["bk"])
-                            script = DT.unpack (bkTarget b) <> argRef
-                            -- macOS Terminal's session save/restore would print
-                            -- to stdout and share the parent tab's history file.
-                            childEnv = ("SHELL_SESSIONS_DISABLE","1")
-                                     : filter ((/= "SHELL_SESSIONS_DISABLE") . fst) curEnv
-                            cp     = (proc sh (["-i", "-c", script] <> zeroArg <> map DT.unpack inArgs))
-                                         { delegate_ctlc = True
-                                         , env           = Just childEnv }
-                        (_,_,_,ph) <- createProcess cp
-                        waitForProcess ph >>= exitWith
-    return Nothing
-
--- | The user's shell, taken from @$SHELL@, falling back to @/bin/sh@.
-userShell :: IO FilePath
-userShell = do
-    mShell <- lookupEnv "SHELL"
-    pure $ case mShell of
-        Just sh | not (null sh) -> sh
-        _                       -> "/bin/sh"
+                        Lib.putStrLnStdErr 
+                            $ "error: target is empty for label \"" 
+                            <> (bkLabel b) 
+                            <> "\""
+                    | otherwise -> runCmdInShell (bkTarget b) inArgs 
+                                >>= exitWith
 
 -- | Handler for the @recents@ option.
 handleRecentsbk 

@@ -8,10 +8,25 @@ INIT_TESTS=(
   test_init_creates_bookmarks_file_and_completions
   test_init_sets_up_rc_file
   test_init_completions_load_in_shell
+  test_init_profile_exported_in_shell
   test_init_rerun_is_idempotent
   test_init_declined_leaves_rc_file_alone
+  test_init_custom_profile
+  test_init_profile_already_in_env
   test_init_unsupported_shell_fails
 )
+
+# Answers to the `bk init` prompts that accept everything: add the completion
+# setup (bash and zsh only), take the default profile, and add the BK_PROFILE
+# export (bash and zsh only). Fish has no rc file, so it only gets the profile
+# name prompt.
+accept_all_init_answers() {
+  if [[ $TEST_SHELL == fish ]]; then
+    printf '\n'
+  else
+    printf 'y\n\ny\n'
+  fi
+}
 
 # Output of the `bk init` in test_init_creates_bookmarks_file_and_completions,
 # inspected by test_init_sets_up_rc_file.
@@ -36,7 +51,7 @@ test_init_uninitialized_bk_refuses_to_run() {
 }
 
 test_init_creates_bookmarks_file_and_completions() {
-  sh_run --stdin $'y\n' 'bk init'
+  sh_run --stdin "$(accept_all_init_answers)" 'bk init'
   INIT_OUT=$OUT
   assert_code 0
   assert_out_contains "Installed $(shell_label) completions to $(completion_file)"
@@ -54,6 +69,9 @@ test_init_sets_up_rc_file() {
     assert_no_path "$TEST_HOME/.config/fish/config.fish"
     assert_no_path "$TEST_HOME/.bashrc"
     assert_no_path "$TEST_HOME/.zshrc"
+    # The profile still has to be set, so init prints the command for it.
+    assert_out_contains 'Profile name [default]: '
+    assert_out_contains 'set -Ux BK_PROFILE default'
     return
   fi
   local rc
@@ -67,6 +85,19 @@ test_init_sets_up_rc_file() {
     zsh)  assert_count "$rc" 1 'fpath=("$HOME/.bk/completions" $fpath)'
           assert_count "$rc" 1 'compdef _bk bk' ;;
   esac
+  assert_out_contains 'Profile name [default]: '
+  assert_out_contains "Add BK_PROFILE export to $rc? [Y/n]"
+  assert_out_contains "Added BK_PROFILE export to $rc"
+  assert_count "$rc" 1 '# bk profile start'
+  assert_count "$rc" 1 '# bk profile end'
+  assert_count "$rc" 1 'export BK_PROFILE="default"'
+}
+
+test_init_profile_exported_in_shell() {
+  # Fish has no rc file for init to export the variable from.
+  [[ $TEST_SHELL == fish ]] && return
+  sh_run -i 'echo "$BK_PROFILE"'
+  assert_out 'default'
 }
 
 test_init_completions_load_in_shell() {
@@ -94,6 +125,11 @@ test_init_rerun_is_idempotent() {
   if [[ -n $rc ]]; then
     assert_out_contains "Completion setup already present in $rc"
     assert_count "$rc" 1 '# bk completions start'
+    # BK_PROFILE isn't in this (cleared) environment, so the profile is read
+    # back from the rc file rather than asked for again.
+    assert_out_not_contains 'Profile name'
+    assert_out_contains "BK_PROFILE export already present in $rc"
+    assert_count "$rc" 1 '# bk profile start'
   fi
   # Existing bookmarks survive a re-init.
   sh_run 'bk keepme'
@@ -107,18 +143,59 @@ test_init_declined_leaves_rc_file_alone() {
   with_scratch_home
   local rc
   rc=$(rc_file)
-  # An unrecognised answer re-prompts; "n" declines.
-  sh_run --stdin $'maybe\nn\n' 'bk init'
+  # An unrecognised answer re-prompts; "n" declines. Then the default profile
+  # is taken and its export declined too.
+  sh_run --stdin $'maybe\nn\n\nn\n' 'bk init'
   assert_code 0
-  [[ $(grep -o '\[Y/n\]' <<<"$OUT" | wc -l) -eq 2 ]] ||
-    fail "expected to be prompted twice (once for 'maybe', once for 'n')"
-  assert_out_contains "Left $rc unchanged."
+  [[ $(grep -o '\[Y/n\]' <<<"$OUT" | wc -l) -eq 3 ]] ||
+    fail "expected to be prompted three times (completions: 'maybe', 'n'; profile: 'n')"
+  assert_out_contains "Left $rc unchanged. To enable completions"
+  assert_out_contains "Left $rc unchanged. To set your bk profile"
   # The lines to add by hand are printed instead.
   assert_out_contains '# bk completions start'
+  assert_out_contains '# bk profile start'
+  assert_out_contains 'export BK_PROFILE="default"'
   assert_no_path "$rc"
   # Everything else is still set up.
   assert_file "$(csv_file)"
   assert_file "$(completion_file)"
+  restore_home
+}
+
+test_init_custom_profile() {
+  with_scratch_home
+  local rc
+  rc=$(rc_file)
+  # An invalid name re-prompts; "work" is accepted.
+  if [[ $TEST_SHELL == fish ]]; then
+    sh_run --stdin $'bad name\nwork\n' 'bk init'
+  else
+    sh_run --stdin $'y\nbad name\nwork\ny\n' 'bk init'
+  fi
+  assert_code 0
+  assert_out_contains "Profile names may only contain letters, digits, '-' and '_'."
+  [[ $(grep -o 'Profile name \[default\]' <<<"$OUT" | wc -l) -eq 2 ]] ||
+    fail "expected to be asked for a profile name twice"
+  if [[ $TEST_SHELL == fish ]]; then
+    assert_out_contains 'set -Ux BK_PROFILE work'
+  else
+    assert_count "$rc" 1 'export BK_PROFILE="work"'
+    sh_run -i 'echo "$BK_PROFILE"'
+    assert_out 'work'
+  fi
+  restore_home
+}
+
+test_init_profile_already_in_env() {
+  with_scratch_home
+  local rc
+  rc=$(rc_file)
+  sh_run --stdin $'y\n' 'BK_PROFILE=home bk init'
+  assert_code 0
+  # The profile is taken from the environment: no prompt, nothing exported.
+  assert_out_not_contains 'Profile name'
+  assert_out_not_contains 'BK_PROFILE'
+  [[ -n $rc ]] && assert_count "$rc" 0 '# bk profile start'
   restore_home
 }
 
